@@ -1,0 +1,18 @@
+{
+  "users": {},
+  "balance": {},
+  "proxy": {
+    "name": "200 MB Proxy",
+    "mb": 200,
+    "price": 10,
+    "stock": []
+  },
+  "vpn": {
+    "name": "30 Days VPN",
+    "days": 30,
+    "price": 50,
+    "stock": []
+  },
+  "orders": {},
+  "next_order_id": 1
+}
