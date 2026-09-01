@@ -4,8 +4,8 @@ from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-BOT_TOKEN = os.environ["8864026991:AAEM_QgbvbfrKcPVDRGEVy3j6khjggkEO-c"]
-ADMIN_ID = int(os.environ["8001997389"])
+BOT_TOKEN = "8864026991:AAEM_QgbvbfrKcPVDRGEVy3j6khjggkEO-c"
+ADMIN_ID ="8001997389"
 DATA_FILE = Path("data.json")
 LOCK = threading.Lock()
 
