@@ -15,8 +15,8 @@ editing the CONFIG section below directly:
 
 Run:
     pip install -r requirements.txt
-    export BOT_TOKEN="8805001071:AAFe5ORvRD5QAqH3eU4sCAbT9GjlfmBm8QM"
-    export ADMIN_IDS="8001997389"
+    export BOT_TOKEN="8805001071:AAHd9M8GLsX5oIKk7aJbtQM5VaRbiepUXe0"
+    export ADMIN_IDS="8805001071"
     python bot.py
 
 All persistent state (users, stock, prices, settings, orders, deposits)
@@ -89,10 +89,14 @@ DEFAULT_DATA: Dict[str, Any] = {
         "store_name": DEFAULT_STORE_NAME,
         "welcome_message": "",           # custom welcome text, optional (overrides default)
         "vpn_duration_days": 0,          # 0 = not set / unlimited
+        "low_stock_threshold": 0,        # 0 = disabled; alert admins when stock falls to/below this
+        "min_deposit_amount": 0,         # 0 = no minimum
     },
     "orders": [],        # list of order dicts
     "deposits": {},       # deposit_id -> {user_id, amount, txid, status, time}
     "next_order_id": 1,
+    "extra_admins": [],          # list of int user IDs granted admin access at runtime
+    "low_stock_notified": {p: False for p in PRODUCTS},  # avoid repeat spam per product
 }
 
 
@@ -111,6 +115,8 @@ def load_data() -> Dict[str, Any]:
     for p in PRODUCTS:
         data["stock"].setdefault(p, [])
         data["prices"].setdefault(p, 0)
+        data["low_stock_notified"].setdefault(p, False)
+    data.setdefault("extra_admins", [])
     return data
 
 
@@ -158,7 +164,16 @@ def get_user(user_id: int, username: Optional[str] = None, first_name: Optional[
 
 
 def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in DATA.get("extra_admins", [])
+
+
+def is_super_admin(user_id: int) -> bool:
+    """Only env-configured admins can manage other admins."""
     return user_id in ADMIN_IDS
+
+
+def get_all_admin_ids() -> List[int]:
+    return list(ADMIN_IDS) + [aid for aid in DATA.get("extra_admins", []) if aid not in ADMIN_IDS]
 
 
 def fmt_money(amount: float) -> str:
@@ -175,6 +190,7 @@ BTN_BUY_GMAIL = "🟢 Buy Gmail Account"
 BTN_ADD_MONEY = "🟢 Add Money"
 BTN_PROFILE = "🟣 Profile"
 BTN_HELP = "🟢 Help"
+BTN_ADMIN_PANEL = "🛠️ Admin Panel"
 
 MAIN_MENU_BUTTONS = [
     [BTN_BUY_PROXY, BTN_BUY_VPN, BTN_BUY_GMAIL],
@@ -183,9 +199,12 @@ MAIN_MENU_BUTTONS = [
 ]
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
+def main_menu_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    rows = [list(row) for row in MAIN_MENU_BUTTONS]
+    if user_id is not None and is_admin(user_id):
+        rows.append([BTN_ADMIN_PANEL])
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(b) for b in row] for row in MAIN_MENU_BUTTONS],
+        [[KeyboardButton(b) for b in row] for row in rows],
         resize_keyboard=True,
     )
 
@@ -223,7 +242,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Use the menu below to get started."
         )
     await update.message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard()
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard(user.id)
     )
 
 
@@ -259,15 +278,13 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def add_money(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = DATA["settings"]
     text = (
-        "💰 *Add Money via bKash*\n\n"
-        f"Send payment to bKash number: `{settings.get('bkash_number', 'Not set')}` (Send Money)\n\n"
-        "Then reply with your deposit in this exact format:\n"
-        "`AMOUNT TXID`\n\n"
-        "Example: `500 8N7A2K9XYZ`"
+        "💰 *Add Money*\n\n"
+        "আপনি কত টাকা অ্যাড করতে চান?\n"
+        "শুধু সংখ্যা লিখে পাঠান।\n\n"
+        "উদাহরণ: `500`"
     )
-    set_awaiting(context, "deposit_submit")
+    set_awaiting(context, "deposit_amount")
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -336,6 +353,34 @@ async def buy_product(update: Update, context: ContextTypes.DEFAULT_TYPE, produc
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    await maybe_send_low_stock_alert(context, product_key)
+
+
+async def maybe_send_low_stock_alert(context: ContextTypes.DEFAULT_TYPE, product_key: str) -> None:
+    threshold = DATA["settings"].get("low_stock_threshold", 0)
+    if not threshold:
+        return
+    remaining = len(DATA["stock"][product_key])
+    already_notified = DATA["low_stock_notified"].get(product_key, False)
+
+    if remaining <= threshold and not already_notified:
+        DATA["low_stock_notified"][product_key] = True
+        persist()
+        text = (
+            f"⚠️ *Low Stock Alert*\n\n"
+            f"*{PRODUCTS[product_key]}* stock is down to {remaining} "
+            f"(threshold: {threshold}).\nPlease add more stock soon."
+        )
+        for admin_id in get_all_admin_ids():
+            try:
+                await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                logger.exception("Failed to send low-stock alert to admin %s", admin_id)
+    elif remaining > threshold and already_notified:
+        # Stock replenished above threshold again - reset so future dips re-alert
+        DATA["low_stock_notified"][product_key] = False
+        persist()
+
 
 # --------------------------------------------------------------------------- #
 # TEXT ROUTER (reply-keyboard buttons + pending text inputs)
@@ -363,9 +408,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await profile(update, context)
     elif text == BTN_HELP:
         await help_command(update, context)
+    elif text == BTN_ADMIN_PANEL and is_admin(user.id):
+        await admin_command(update, context)
     else:
         await update.message.reply_text(
-            "Please use the menu buttons below.", reply_markup=main_menu_keyboard()
+            "Please use the menu buttons below.", reply_markup=main_menu_keyboard(user.id)
         )
 
 
@@ -375,22 +422,42 @@ async def handle_awaiting_input(
     action = awaiting.get("action")
     user = update.effective_user
 
-    # ---------------- User-side: deposit submission ---------------- #
-    if action == "deposit_submit":
-        parts = text.split()
-        if len(parts) < 2:
-            await update.message.reply_text(
-                "❌ Invalid format. Please send as: `AMOUNT TXID`", parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        amount_str, txid = parts[0], " ".join(parts[1:])
+    # ---------------- User-side: deposit flow (Step 1 - amount) ---------------- #
+    if action == "deposit_amount":
         try:
-            amount = float(amount_str)
+            amount = float(text.strip())
             if amount <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Please try again with: `AMOUNT TXID`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text("❌ সঠিক পরিমাণ লিখুন (শুধু সংখ্যা)। উদাহরণ: `500`", parse_mode=ParseMode.MARKDOWN)
             return
+
+        settings = DATA["settings"]
+        min_deposit = settings.get("min_deposit_amount", 0)
+        if min_deposit and amount < min_deposit:
+            await update.message.reply_text(
+                f"❌ সর্বনিম্ন ডিপোজিট পরিমাণ {fmt_money(min_deposit)}। এর চেয়ে বেশি একটা সংখ্যা লিখুন।",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        bkash_number = settings.get("bkash_number", "Not set")
+        text_out = (
+            f"💵 আপনি *{fmt_money(amount)}* টাকা অ্যাড করতে চাচ্ছেন।\n\n"
+            f"এই বিকাশ নাম্বারে *Send Money* করুন:\n`{bkash_number}`\n\n"
+            "টাকা পাঠানোর পর, Transaction ID (TxID) টা এখানে পাঠান।"
+        )
+        set_awaiting(context, "deposit_txid", amount=amount)
+        await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ---------------- User-side: deposit flow (Step 2 - TxID) ---------------- #
+    if action == "deposit_txid":
+        txid = text.strip()
+        if not txid:
+            await update.message.reply_text("❌ সঠিক Transaction ID (TxID) পাঠান।")
+            return
+        amount = awaiting.get("amount", 0)
 
         deposit_id = uuid.uuid4().hex[:10]
         DATA["deposits"][deposit_id] = {
@@ -405,7 +472,7 @@ async def handle_awaiting_input(
         clear_awaiting(context)
 
         await update.message.reply_text(
-            "✅ Your deposit request has been submitted and is pending admin approval.\n"
+            "✅ আপনার ডিপোজিট রিকোয়েস্ট জমা হয়েছে, অ্যাডমিন এপ্রুভ করার অপেক্ষায় আছে।\n"
             f"Amount: {fmt_money(amount)}\nTxID: `{txid}`",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -425,7 +492,7 @@ async def handle_awaiting_input(
                 ]
             ]
         )
-        for admin_id in ADMIN_IDS:
+        for admin_id in get_all_admin_ids():
             try:
                 await context.bot.send_message(admin_id, admin_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             except Exception:
@@ -489,6 +556,38 @@ async def handle_awaiting_input(
         persist()
         clear_awaiting(context)
         await update.message.reply_text(f"✅ VPN duration set to {days} day(s).")
+    elif action == "admin_set_low_stock_threshold":
+        try:
+            threshold = int(text.strip())
+            if threshold < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Please send a whole number (0 = disable alerts).")
+            return
+        DATA["settings"]["low_stock_threshold"] = threshold
+        for p in PRODUCTS:
+            DATA["low_stock_notified"][p] = False
+        persist()
+        clear_awaiting(context)
+        await update.message.reply_text(f"✅ Low stock threshold set to {threshold}.")
+    elif action == "admin_set_min_deposit":
+        try:
+            min_amt = float(text.strip())
+            if min_amt < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Please send a valid number (0 = no minimum).")
+            return
+        DATA["settings"]["min_deposit_amount"] = min_amt
+        persist()
+        clear_awaiting(context)
+        await update.message.reply_text(f"✅ Minimum deposit amount set to {fmt_money(min_amt)}.")
+    elif action == "admin_user_search":
+        await admin_apply_user_search(update, context, text)
+    elif action == "admin_add_admin":
+        await admin_apply_add_admin(update, context, text)
+    elif action == "admin_remove_admin":
+        await admin_apply_remove_admin(update, context, text)
     elif action == "admin_ban_user":
         await admin_apply_ban(update, context, text, ban=True)
     elif action == "admin_unban_user":
@@ -562,6 +661,9 @@ async def admin_apply_add_stock(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ No valid lines found. Please send one stock item per line.")
         return
     DATA["stock"][product].extend(lines)
+    threshold = DATA["settings"].get("low_stock_threshold", 0)
+    if not threshold or len(DATA["stock"][product]) > threshold:
+        DATA["low_stock_notified"][product] = False
     persist()
     clear_awaiting(context)
     await update.message.reply_text(
@@ -656,15 +758,20 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 VPN Duration Settings", callback_data="adm:vpn_duration")],
         [InlineKeyboardButton("📈 Sales History", callback_data="adm:sales_history")],
         [InlineKeyboardButton("🧾 Order History", callback_data="adm:order_history:0")],
+        [InlineKeyboardButton("💳 Deposit History", callback_data="adm:deposit_history:0")],
         [InlineKeyboardButton("👥 User List", callback_data="adm:user_list:0")],
+        [InlineKeyboardButton("🔍 User Search", callback_data="adm:user_search")],
         [InlineKeyboardButton("🚫 Ban / Unban User", callback_data="adm:ban_unban")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast")],
         [InlineKeyboardButton("📊 Stock Count", callback_data="adm:stock_count")],
         [InlineKeyboardButton("🗑️ Delete Stock", callback_data="adm:delete_stock")],
+        [InlineKeyboardButton("📉 Low Stock Alert Settings", callback_data="adm:low_stock_settings")],
         [InlineKeyboardButton("💳 Payment Settings", callback_data="adm:payment_settings")],
         [InlineKeyboardButton("💸 Withdrawal Settings", callback_data="adm:withdrawal_settings")],
         [InlineKeyboardButton("🆘 Help Settings", callback_data="adm:help_settings")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm:bot_settings")],
+        [InlineKeyboardButton("👑 Admin Management", callback_data="adm:admin_mgmt")],
+        [InlineKeyboardButton("💾 Backup / Export Data", callback_data="adm:backup")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -736,6 +843,20 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         await show_help_settings_menu(update, context)
     elif data == "adm:bot_settings":
         await show_bot_settings_menu(update, context)
+    elif data == "adm:low_stock_settings":
+        await show_low_stock_settings_menu(update, context)
+    elif data.startswith("adm:deposit_history:"):
+        page = int(data.split(":")[2])
+        await show_deposit_history(update, context, page=page)
+    elif data == "adm:user_search":
+        set_awaiting(context, "admin_user_search")
+        await query.edit_message_text(
+            "🔍 খুঁজতে চাওয়া User ID পাঠান।", reply_markup=back_button()
+        )
+    elif data == "adm:admin_mgmt":
+        await show_admin_mgmt_menu(update, context)
+    elif data == "adm:backup":
+        await send_backup_file(update, context)
     elif data.startswith("bal:"):
         await handle_balance_action(update, context, data)
     elif data.startswith("pstock:"):
@@ -754,6 +875,10 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_help_settings_action(update, context, data)
     elif data.startswith("bset:"):
         await handle_bot_settings_action(update, context, data)
+    elif data.startswith("lowstock:"):
+        await handle_low_stock_settings_action(update, context, data)
+    elif data.startswith("admmgmt:"):
+        await handle_admin_mgmt_action(update, context, data)
 
 
 # ---- Dashboard / Statistics ---- #
@@ -1068,10 +1193,16 @@ async def handle_delete_stock_action(update: Update, context: ContextTypes.DEFAU
 
 async def show_payment_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     current = DATA["settings"].get("bkash_number", "Not set")
-    text = f"💳 *Payment Settings*\n\nCurrent bKash number: `{current}`"
+    min_deposit = DATA["settings"].get("min_deposit_amount", 0)
+    text = (
+        f"💳 *Payment Settings*\n\n"
+        f"Current bKash number: `{current}`\n"
+        f"Minimum deposit amount: {fmt_money(min_deposit) if min_deposit else 'Not set (no minimum)'}"
+    )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Set bKash Number", callback_data="pay:set_bkash")],
+            [InlineKeyboardButton("✏️ Set Minimum Deposit Amount", callback_data="pay:set_min_deposit")],
             [InlineKeyboardButton("⬅️ Back", callback_data="adm:main")],
         ]
     )
@@ -1084,6 +1215,13 @@ async def handle_payment_settings_action(update: Update, context: ContextTypes.D
         set_awaiting(context, "admin_set_bkash")
         await query.edit_message_text(
             "📱 Send the new bKash number (shown to users for deposits).",
+            reply_markup=back_button("adm:payment_settings"),
+        )
+    elif data == "pay:set_min_deposit":
+        set_awaiting(context, "admin_set_min_deposit")
+        await query.edit_message_text(
+            "💵 Send the minimum deposit amount (number only, `0` = no minimum).",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_button("adm:payment_settings"),
         )
 
@@ -1181,6 +1319,209 @@ async def handle_bot_settings_action(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(
             "👋 Send the new /start welcome message text.", reply_markup=back_button("adm:bot_settings")
         )
+
+
+# ---- Low Stock Alert Settings ---- #
+
+async def show_low_stock_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    threshold = DATA["settings"].get("low_stock_threshold", 0)
+    text = (
+        "📉 *Low Stock Alert Settings*\n\n"
+        f"Current threshold: {threshold if threshold else 'Disabled'}\n\n"
+        "When any product's stock falls to or below this number, all admins "
+        "get notified automatically."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Set Threshold", callback_data="lowstock:set")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="adm:main")],
+        ]
+    )
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def handle_low_stock_settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    query = update.callback_query
+    if data == "lowstock:set":
+        set_awaiting(context, "admin_set_low_stock_threshold")
+        await query.edit_message_text(
+            "📉 Send the stock threshold number (e.g. `5`). Send `0` to disable alerts.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button("adm:low_stock_settings"),
+        )
+
+
+# ---- Deposit History (all statuses, paginated) ---- #
+
+DEPOSITS_PER_PAGE = 10
+
+
+async def show_deposit_history(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
+    all_deposits = sorted(DATA["deposits"].items(), key=lambda kv: kv[1]["time"], reverse=True)
+    start = page * DEPOSITS_PER_PAGE
+    chunk = all_deposits[start:start + DEPOSITS_PER_PAGE]
+
+    status_icons = {"pending": "⏳", "approved": "✅", "rejected": "❌"}
+
+    if not chunk:
+        text = "💳 *Deposit History*\n\nNo deposits yet."
+    else:
+        lines = []
+        for dep_id, d in chunk:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["time"]))
+            icon = status_icons.get(d["status"], "❓")
+            lines.append(
+                f"{icon} {fmt_money(d['amount'])} | user `{d['user_id']}` | "
+                f"TxID: `{d['txid']}` | {ts}"
+            )
+        text = f"💳 *Deposit History* (page {page + 1})\n\n" + "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"adm:deposit_history:{page - 1}"))
+    if start + DEPOSITS_PER_PAGE < len(all_deposits):
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm:deposit_history:{page + 1}"))
+    rows = [nav_row] if nav_row else []
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:main")])
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+
+
+# ---- User Search (full profile by User ID) ---- #
+
+async def admin_apply_user_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    clear_awaiting(context)
+    try:
+        target_uid = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ সঠিক নিউমেরিক User ID পাঠান।")
+        return
+
+    u = DATA["users"].get(str(target_uid))
+    if u is None:
+        await update.message.reply_text("❌ User পাওয়া যায়নি।")
+        return
+
+    joined = time.strftime("%Y-%m-%d %H:%M", time.localtime(u.get("joined", 0)))
+    orders = u.get("orders", [])
+    order_objs = [o for o in DATA["orders"] if o["id"] in orders]
+    recent = order_objs[-5:][::-1]
+    recent_lines = "\n".join(
+        f"  • #{o['id']} {o['product_label']} - {fmt_money(o['price'])}" for o in recent
+    ) or "  (কোনো অর্ডার নেই)"
+
+    text_out = (
+        f"🔍 *User Details*\n\n"
+        f"User ID: `{target_uid}`\n"
+        f"Username: @{u.get('username') or 'N/A'}\n"
+        f"Name: {u.get('first_name') or 'N/A'}\n"
+        f"Balance: {fmt_money(u['balance'])}\n"
+        f"Status: {'🚫 Banned' if u.get('banned') else '✅ Active'}\n"
+        f"Joined: {joined}\n"
+        f"Total Orders: {len(orders)}\n\n"
+        f"*Recent Orders:*\n{recent_lines}"
+    )
+    await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN)
+
+
+# ---- Admin Management (multiple admins) ---- #
+
+async def show_admin_mgmt_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    env_admins = ", ".join(f"`{a}`" for a in ADMIN_IDS) or "(none)"
+    extra_admins = DATA.get("extra_admins", [])
+    extra_lines = ", ".join(f"`{a}`" for a in extra_admins) or "(none)"
+    text = (
+        "👑 *Admin Management*\n\n"
+        f"Super admins (env-configured): {env_admins}\n"
+        f"Additional admins: {extra_lines}"
+    )
+    if not is_super_admin(query.from_user.id):
+        text += "\n\n⚠️ Only super admins can add or remove admins."
+        kb = back_button()
+    else:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ Add Admin", callback_data="admmgmt:add")],
+                [InlineKeyboardButton("➖ Remove Admin", callback_data="admmgmt:remove")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="adm:main")],
+            ]
+        )
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def handle_admin_mgmt_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    query = update.callback_query
+    if not is_super_admin(query.from_user.id):
+        await query.answer("⛔ Only super admins can do this.", show_alert=True)
+        return
+    if data == "admmgmt:add":
+        set_awaiting(context, "admin_add_admin")
+        await query.edit_message_text("➕ Send the User ID to grant admin access.", reply_markup=back_button("adm:admin_mgmt"))
+    elif data == "admmgmt:remove":
+        set_awaiting(context, "admin_remove_admin")
+        await query.edit_message_text("➖ Send the User ID to revoke admin access.", reply_markup=back_button("adm:admin_mgmt"))
+
+
+async def admin_apply_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    clear_awaiting(context)
+    if not is_super_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Only super admins can do this.")
+        return
+    try:
+        new_admin_id = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ সঠিক নিউমেরিক User ID পাঠান।")
+        return
+    if new_admin_id in ADMIN_IDS or new_admin_id in DATA["extra_admins"]:
+        await update.message.reply_text("এই ইউজার ইতিমধ্যে admin।")
+        return
+    DATA["extra_admins"].append(new_admin_id)
+    persist()
+    await update.message.reply_text(f"✅ User `{new_admin_id}` কে admin access দেওয়া হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+    try:
+        await context.bot.send_message(new_admin_id, "👑 আপনাকে এই বটের admin access দেওয়া হয়েছে। /admin দিয়ে প্যানেল দেখুন।")
+    except Exception:
+        logger.exception("Could not notify new admin %s", new_admin_id)
+
+
+async def admin_apply_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    clear_awaiting(context)
+    if not is_super_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Only super admins can do this.")
+        return
+    try:
+        target_id = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ সঠিক নিউমেরিক User ID পাঠান।")
+        return
+    if target_id in ADMIN_IDS:
+        await update.message.reply_text("⚠️ এটা একটা env-configured super admin — কোডের বাইরে থেকে রিমুভ করা যাবে না।")
+        return
+    if target_id not in DATA["extra_admins"]:
+        await update.message.reply_text("এই ইউজার admin লিস্টে নেই।")
+        return
+    DATA["extra_admins"].remove(target_id)
+    persist()
+    await update.message.reply_text(f"✅ User `{target_id}` এর admin access সরানো হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+
+
+# ---- Backup / Export Data ---- #
+
+async def send_backup_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    persist()
+    try:
+        with open(DATA_FILE, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=f,
+                filename=f"data_backup_{int(time.time())}.json",
+                caption="💾 Current data.json backup.",
+            )
+        await query.answer("Backup sent!", show_alert=False)
+    except Exception:
+        logger.exception("Failed to send backup file")
+        await query.answer("❌ Backup পাঠাতে সমস্যা হয়েছে।", show_alert=True)
 
 
 # --------------------------------------------------------------------------- #
