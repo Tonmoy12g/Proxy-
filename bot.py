@@ -15,8 +15,8 @@ editing the CONFIG section below directly:
 
 Run:
     pip install -r requirements.txt
-    export BOT_TOKEN="123456:ABC-your-token"
-    export ADMIN_IDS="111111111,222222222"
+    export BOT_TOKEN="8805001071:AAFe5ORvRD5QAqH3eU4sCAbT9GjlfmBm8QM"
+    export ADMIN_IDS="8001997389"
     python bot.py
 
 All persistent state (users, stock, prices, settings, orders, deposits)
